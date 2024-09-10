@@ -1,0 +1,878 @@
+package ofctl
+
+/*
+#include <config.h>
+
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <dirs.h>
+#include "ofp-version-opt.h"
+#include <ofproto/ofproto.h>
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/ofp-actions.h"
+#include <openvswitch/ofp-port.h>
+#include <openvswitch/ofp-util.h>
+#include <openvswitch/ofp-print.h>
+#include <openvswitch/ofp-msgs.h>
+#include "openvswitch/ofp-switch.h"
+#include "openvswitch/ofp-table.h"
+#include <openvswitch/ofp-flow.h>
+#include <openvswitch/ofpbuf.h>
+#include <openvswitch/vconn.h>
+#include <openvswitch/vlog.h>
+#include <openvswitch/shash.h>
+
+#include <socket-util.h>
+#include <util.h>
+
+VLOG_DEFINE_THIS_MODULE(ofctl);
+
+static void
+run(int retval, const char *message, ...)
+{
+   if (retval) {
+       va_list args;
+
+       va_start(args, message);
+       ovs_fatal_valist(retval, message, args);
+   }
+}
+
+static int
+open_vconn_socket(const char *name, struct vconn **vconnp)
+{
+   char *vconn_name = xasprintf("unix:%s", name);
+   int error;
+
+   error = vconn_open(vconn_name, get_allowed_ofp_versions(), DSCP_DEFAULT,
+                      vconnp);
+   if (error && error != ENOENT) {
+       ovs_fatal(0, "%s: failed to open socket (%s)", name,
+                 ovs_strerror(error));
+   }
+   free(vconn_name);
+
+   return error;
+}
+
+enum open_target { MGMT, SNOOP };
+
+static enum ofputil_protocol
+open_vconn__(const char *name, enum open_target target,
+            struct vconn **vconnp)
+{
+   const char *suffix = target == MGMT ? "mgmt" : "snoop";
+   char *datapath_name, *datapath_type, *socket_name;
+   enum ofputil_protocol protocol;
+   char *bridge_path;
+   int ofp_version;
+   int error;
+
+   bridge_path = xasprintf("%s/%s.%s", ovs_rundir(), name, suffix);
+
+   ofproto_parse_name(name, &datapath_name, &datapath_type);
+   socket_name = xasprintf("%s/%s.%s", ovs_rundir(), datapath_name, suffix);
+   free(datapath_name);
+   free(datapath_type);
+
+   if (strchr(name, ':')) {
+       run(vconn_open(name, get_allowed_ofp_versions(), DSCP_DEFAULT, vconnp),
+           "connecting to %s", name);
+   } else if (!open_vconn_socket(name, vconnp)) {
+       // Fall Through.
+   } else if (!open_vconn_socket(bridge_path, vconnp)) {
+       // Fall Through.
+   } else if (!open_vconn_socket(socket_name, vconnp)) {
+       // Fall Through.
+   } else {
+       free(bridge_path);
+       free(socket_name);
+       ovs_fatal(0, "%s is not a bridge or a socket", name);
+   }
+
+   if (target == SNOOP) {
+       vconn_set_recv_any_version(*vconnp);
+   }
+
+   free(bridge_path);
+   free(socket_name);
+
+   VLOG_DBG("connecting to %s", vconn_get_name(*vconnp));
+   error = vconn_connect_block(*vconnp, -1);
+   if (error) {
+       ovs_fatal(0, "%s: failed to connect to socket (%s)", name,
+                 ovs_strerror(error));
+   }
+
+   ofp_version = vconn_get_version(*vconnp);
+   protocol = ofputil_protocol_from_ofp_version(ofp_version);
+   if (!protocol) {
+       ovs_fatal(0, "%s: unsupported OpenFlow version 0x%02x",
+                 name, ofp_version);
+   }
+   return protocol;
+}
+
+static enum ofputil_protocol
+open_vconn(const char *name, struct vconn **vconnp)
+{
+   return open_vconn__(name, MGMT, vconnp);
+}
+
+static void
+send_openflow_buffer(struct vconn *vconn, struct ofpbuf *buffer)
+{
+   run(vconn_send_block(vconn, buffer), "failed to send packet to switch");
+}
+
+
+static bool
+try_set_protocol(struct vconn *vconn, enum ofputil_protocol want, enum ofputil_protocol *cur)
+{
+   for (;;) {
+       struct ofpbuf *request, *reply;
+       enum ofputil_protocol next;
+
+       request = ofputil_encode_set_protocol(*cur, want, &next);
+       if (!request) {
+           return *cur == want;
+       }
+
+       run(vconn_transact_noreply(vconn, request, &reply),
+           "talking to %s", vconn_get_name(vconn));
+       if (reply) {
+           char *s = ofp_to_string(reply->data, reply->size, NULL, NULL, 2);
+           VLOG_DBG("%s: failed to set protocol, switch replied: %s",
+                    vconn_get_name(vconn), s);
+           free(s);
+           ofpbuf_delete(reply);
+           return false;
+       }
+
+       *cur = next;
+   }
+}
+
+static enum
+ofputil_protocol allowed_protocols = OFPUTIL_P_ANY;
+
+static enum ofputil_protocol
+set_protocol_for_flow_dump(struct vconn *vconn,
+                          enum ofputil_protocol cur_protocol,
+                          enum ofputil_protocol usable_protocols)
+{
+   char *usable_s;
+   int i;
+
+   for (i = 0; i < ofputil_n_flow_dump_protocols; i++) {
+       enum ofputil_protocol f = ofputil_flow_dump_protocols[i];
+       if (f & usable_protocols & allowed_protocols
+           && try_set_protocol(vconn, f, &cur_protocol)) {
+           return f;
+       }
+   }
+
+   usable_s = ofputil_protocols_to_string(usable_protocols);
+   if (usable_protocols & allowed_protocols) {
+       ovs_fatal(0, "switch does not support any of the usable flow "
+                 "formats (%s)", usable_s);
+} else {
+       char *allowed_s = ofputil_protocols_to_string(allowed_protocols);
+       ovs_fatal(0, "none of the usable flow formats (%s) is among the "
+                 "allowed flow formats (%s)", usable_s, allowed_s);
+   }
+}
+
+static int verbosity;
+//static int use_names = -1;
+//
+//static bool
+//should_accept_names(void)
+//{
+//    return use_names != 0;
+//}
+//
+//static bool
+//should_show_names(void)
+//{
+//    static int interactive = -1;
+//    if (interactive == -1) {
+//        interactive = isatty(STDOUT_FILENO);
+//    }
+//
+//    return use_names > 0 || (use_names == -1 && interactive);
+//}
+
+struct port_iterator {
+   struct vconn *vconn;
+
+   enum { PI_FEATURES, PI_PORT_DESC } variant;
+   struct ofpbuf *reply;
+   ovs_be32 send_xid;
+   bool more;
+};
+
+static void
+port_iterator_fetch_port_desc(struct port_iterator *pi)
+{
+   pi->variant = PI_PORT_DESC;
+   pi->more = true;
+
+   struct ofpbuf *rq = ofputil_encode_port_desc_stats_request(
+       vconn_get_version(pi->vconn), OFPP_ANY);
+   pi->send_xid = ((struct ofp_header *) rq->data)->xid;
+   send_openflow_buffer(pi->vconn, rq);
+}
+
+static void
+port_iterator_fetch_features(struct port_iterator *pi)
+{
+   pi->variant = PI_FEATURES;
+
+   // Fetch the switch's ofp_switch_features.
+   enum ofp_version version = vconn_get_version(pi->vconn);
+   struct ofpbuf *rq = ofpraw_alloc(OFPRAW_OFPT_FEATURES_REQUEST, version, 0);
+   run(vconn_transact(pi->vconn, rq, &pi->reply),
+       "talking to %s", vconn_get_name(pi->vconn));
+
+   enum ofptype type;
+   if (ofptype_decode(&type, pi->reply->data)
+       || type != OFPTYPE_FEATURES_REPLY) {
+       ovs_fatal(0, "%s: received bad features reply",
+                 vconn_get_name(pi->vconn));
+   }
+   if (!ofputil_switch_features_has_ports(pi->reply)) {
+       // The switch features reply does not contain a complete list of ports.
+       // Probably, there are more ports than will fit into a single 64 kB
+       // OpenFlow message.  Use OFPST_PORT_DESC to get a complete list of
+       // ports.
+       ofpbuf_delete(pi->reply);
+       pi->reply = NULL;
+       port_iterator_fetch_port_desc(pi);
+       return;
+   }
+
+   struct ofputil_switch_features features;
+   enum ofperr error = ofputil_pull_switch_features(pi->reply, &features);
+   if (error) {
+       ovs_fatal(0, "%s: failed to decode features reply (%s)",
+                 vconn_get_name(pi->vconn), ofperr_to_string(error));
+   }
+}
+
+static void
+port_iterator_init(struct port_iterator *pi, struct vconn *vconn)
+{
+   memset(pi, 0, sizeof *pi);
+   pi->vconn = vconn;
+   if (vconn_get_version(vconn) < OFP13_VERSION) {
+       port_iterator_fetch_features(pi);
+   } else {
+       port_iterator_fetch_port_desc(pi);
+   }
+}
+
+static bool
+port_iterator_next(struct port_iterator *pi, struct ofputil_phy_port *pp)
+{
+   for (;;) {
+       if (pi->reply) {
+           int retval = ofputil_pull_phy_port(vconn_get_version(pi->vconn),
+                                              pi->reply, pp);
+           if (!retval) {
+               return true;
+           } else if (retval != EOF) {
+               ovs_fatal(0, "received bad reply: %s",
+                         ofp_to_string(pi->reply->data, pi->reply->size,
+                                       NULL, NULL, verbosity + 1));
+           }
+       }
+
+       if (pi->variant == PI_FEATURES || !pi->more) {
+           return false;
+       }
+
+       ovs_be32 recv_xid;
+       do {
+           ofpbuf_delete(pi->reply);
+           run(vconn_recv_block(pi->vconn, &pi->reply),
+               "OpenFlow receive failed");
+           recv_xid = ((struct ofp_header *) pi->reply->data)->xid;
+       } while (pi->send_xid != recv_xid);
+
+       struct ofp_header *oh = pi->reply->data;
+       enum ofptype type;
+       if (ofptype_pull(&type, pi->reply)
+           || type != OFPTYPE_PORT_DESC_STATS_REPLY) {
+           ovs_fatal(0, "received bad reply: %s",
+                     ofp_to_string(pi->reply->data, pi->reply->size, NULL,
+                                   NULL, verbosity + 1));
+       }
+
+       pi->more = (ofpmp_flags(oh) & OFPSF_REPLY_MORE) != 0;
+   }
+}
+
+static void
+port_iterator_destroy(struct port_iterator *pi)
+{
+   if (pi) {
+       while (pi->variant == PI_PORT_DESC && pi->more) {
+           // Drain vconn's queue of any other replies for this request.
+           struct ofputil_phy_port pp;
+           port_iterator_next(pi, &pp);
+       }
+
+       ofpbuf_delete(pi->reply);
+   }
+}
+
+static const struct ofputil_port_map *
+get_port_map(const char *vconn_name)
+{
+   static struct shash port_maps = SHASH_INITIALIZER(&port_maps);
+   struct ofputil_port_map *map = shash_find_data(&port_maps, vconn_name);
+   if (!map) {
+       map = xmalloc(sizeof *map);
+       ofputil_port_map_init(map);
+       shash_add(&port_maps, vconn_name, map);
+
+       if (!strchr(vconn_name, ':') || !vconn_verify_name(vconn_name)) {
+			// For an active vconn (which includes a vconn constructed from a
+           // bridge name), connect to it and pull down the port name-number
+           // mapping.
+			struct vconn *vconn;
+           open_vconn(vconn_name, &vconn);
+
+           struct port_iterator pi;
+           struct ofputil_phy_port pp;
+           for (port_iterator_init(&pi, vconn);
+                port_iterator_next(&pi, &pp); ) {
+               ofputil_port_map_put(map, pp.port_no, pp.name);
+           }
+           port_iterator_destroy(&pi);
+
+           vconn_close(vconn);
+       } else {
+			// Don't bother with passive vconns, since it could take a long
+           // time for the remote to try to connect to us.  Don't bother with
+           // invalid vconn names either.
+		}
+   }
+   return map;
+}
+//static const struct ofputil_port_map *
+//ports_to_accept(const char *vconn_name)
+//{
+//    return should_accept_names() ? get_port_map(vconn_name) : NULL;
+//}
+//
+//static const struct ofputil_port_map *
+//ports_to_show(const char *vconn_name)
+//{
+//    return should_show_names() ? get_port_map(vconn_name) : NULL;
+//}
+
+struct table_iterator {
+   struct vconn *vconn;
+
+   enum { TI_STATS, TI_FEATURES } variant;
+   struct ofpbuf *reply;
+   ovs_be32 send_xid;
+   bool more;
+
+   struct ofputil_table_features features;
+   struct ofpbuf raw_properties;
+};
+
+static void
+table_iterator_init(struct table_iterator *ti, struct vconn *vconn)
+{
+   memset(ti, 0, sizeof *ti);
+   ti->vconn = vconn;
+   ti->variant = (vconn_get_version(vconn) < OFP13_VERSION
+                  ? TI_STATS : TI_FEATURES);
+   ti->more = true;
+
+   enum ofpraw ofpraw = (ti->variant == TI_STATS
+                         ? OFPRAW_OFPST_TABLE_REQUEST
+                         : OFPRAW_OFPST13_TABLE_FEATURES_REQUEST);
+   struct ofpbuf *rq = ofpraw_alloc(ofpraw, vconn_get_version(vconn), 0);
+   ti->send_xid = ((struct ofp_header *) rq->data)->xid;
+   send_openflow_buffer(ti->vconn, rq);
+}
+
+static const struct ofputil_table_features *
+table_iterator_next(struct table_iterator *ti)
+{
+   for (;;) {
+       if (ti->reply) {
+           int retval;
+           if (ti->variant == TI_STATS) {
+               struct ofputil_table_stats ts;
+               retval = ofputil_decode_table_stats_reply(ti->reply,
+                                                         &ts, &ti->features);
+           } else {
+               ovs_assert(ti->variant == TI_FEATURES);
+               retval = ofputil_decode_table_features(ti->reply,
+                                                      &ti->features,
+                                                      &ti->raw_properties);
+           }
+           if (!retval) {
+               return &ti->features;
+           } else if (retval != EOF) {
+               ovs_fatal(0, "received bad reply: %s",
+                         ofp_to_string(ti->reply->data, ti->reply->size,
+                                       NULL, NULL, verbosity + 1));
+           }
+       }
+
+       if (!ti->more) {
+           return NULL;
+       }
+
+       ovs_be32 recv_xid;
+       do {
+           ofpbuf_delete(ti->reply);
+           run(vconn_recv_block(ti->vconn, &ti->reply),
+               "OpenFlow receive failed");
+           recv_xid = ((struct ofp_header *) ti->reply->data)->xid;
+       } while (ti->send_xid != recv_xid);
+
+       struct ofp_header *oh = ti->reply->data;
+       enum ofptype type;
+       if (ofptype_pull(&type, ti->reply)
+           || type != (ti->variant == TI_STATS
+                       ? OFPTYPE_TABLE_STATS_REPLY
+                       : OFPTYPE_TABLE_FEATURES_STATS_REPLY)) {
+           ovs_fatal(0, "received bad reply: %s",
+                     ofp_to_string(ti->reply->data, ti->reply->size, NULL,
+                                   NULL, verbosity + 1));
+       }
+
+       ti->more = (ofpmp_flags(oh) & OFPSF_REPLY_MORE) != 0;
+   }
+}
+
+static void
+table_iterator_destroy(struct table_iterator *ti)
+{
+   if (ti) {
+       while (ti->more) {
+           // Drain vconn's queue of any other replies for this request.
+           table_iterator_next(ti);
+       }
+
+       ofpbuf_delete(ti->reply);
+   }
+}
+
+static const struct ofputil_table_map *
+get_table_map(const char *vconn_name)
+{
+   static struct shash table_maps = SHASH_INITIALIZER(&table_maps);
+   struct ofputil_table_map *map = shash_find_data(&table_maps, vconn_name);
+   if (!map) {
+       map = xmalloc(sizeof *map);
+       ofputil_table_map_init(map);
+       shash_add(&table_maps, vconn_name, map);
+
+       if (!strchr(vconn_name, ':') || !vconn_verify_name(vconn_name)) {
+           // For an active vconn (which includes a vconn constructed from a
+           // bridge name), connect to it and pull down the port name-number
+           // mapping.
+           struct vconn *vconn;
+           open_vconn(vconn_name, &vconn);
+
+           struct table_iterator ti;
+           table_iterator_init(&ti, vconn);
+           for (;;) {
+               const struct ofputil_table_features *tf
+                   = table_iterator_next(&ti);
+               if (!tf) {
+                   break;
+               }
+               if (tf->name[0]) {
+                   ofputil_table_map_put(map, tf->table_id, tf->name);
+               }
+           }
+           table_iterator_destroy(&ti);
+
+           vconn_close(vconn);
+       } else {
+           // Don't bother with passive vconns, since it could take a long
+           // time for the remote to try to connect to us.  Don't bother with
+           // invalid vconn names either.
+       }
+   }
+   return map;
+}
+
+//static const struct ofputil_table_map *
+//tables_to_accept(const char *vconn_name)
+//{
+//    return should_accept_names() ? get_table_map(vconn_name) : NULL;
+//}
+//
+//static const struct ofputil_table_map *
+//tables_to_show(const char *vconn_name)
+//{
+//    return should_show_names() ? get_table_map(vconn_name) : NULL;
+//}
+
+ofp_port_t get_ofpact_output_port(struct ofpact_output *output) {
+    return output->port;
+}
+
+uint16_t get_ofpact_output_max_len(struct ofpact_output *output) {
+    return output->max_len;
+}
+
+uint8_t get_ofpact_resubmit_table_id(struct ofpact_resubmit *resubmit) {
+    return resubmit->table_id;
+}
+*/
+import "C"
+import (
+	"fmt"
+	"strings"
+	"unsafe"
+)
+
+/*
+func prepareDumpFlows(argv []string, aggregate bool, fsr *C.struct_ofputil_flow_stats_request, protocolp *C.enum_ofputil_protocol) (*C.struct_vconn, error) {
+	vconnName := C.CString(argv[1])
+	defer C.free(unsafe.Pointer(vconnName))
+
+	// Получение данных для обработки строки запроса
+	match := C.CString("")
+	if len(argv) > 2 {
+		match = C.CString(argv[2])
+		defer C.free(unsafe.Pointer(match))
+	}
+
+	var portMap *C.struct_ofputil_port_map
+	var tableMap *C.struct_ofputil_table_map
+
+	if len(argv) > 2 && argv[2] != "" {
+		portMap = C.ports_to_accept(vconnName)
+		tableMap = C.tables_to_accept(vconnName)
+	}
+
+	var usableProtocols C.enum_ofputil_protocol
+	errorMsg := C.parse_ofp_flow_stats_request_str(fsr, C.bool(aggregate), match, portMap, tableMap, &usableProtocols)
+	if errorMsg != nil {
+		return nil, fmt.Errorf("failed to parse flow stats request: %s", C.GoString(errorMsg))
+	}
+
+	// Открытие соединения
+	var vconn *C.struct_vconn
+	protocol := C.open_vconn(vconnName, &vconn)
+	if vconn == nil {
+		return nil, fmt.Errorf("failed to open vconn: %s", argv[1])
+	}
+
+	// Установка протокола для дампа потоков
+	*protocolp = C.set_protocol_for_flow_dump(vconn, protocol, usableProtocols)
+
+	return vconn, nil
+}
+*/
+
+type FlowStatsDuration struct {
+	ptr *C.struct_ofputil_flow_stats
+}
+
+func (fs *FlowStatsDuration) Sec() uint {
+	return uint(fs.ptr.duration_sec)
+}
+
+func (fs *FlowStatsDuration) NanoSec() float64 {
+	return float64(fs.ptr.duration_sec) + float64(fs.ptr.duration_nsec)*1e-9
+}
+
+func (fs *FlowStatsDuration) String() (str string) {
+	return fmt.Sprintf("%.3f", fs.NanoSec())
+}
+
+type FlowStatsOfpacts struct { // *C.struct_ofpact
+	ptr      *C.struct_ofpact
+	len      C.size_t
+	portMap  *C.struct_ofputil_port_map
+	tableMap *C.struct_ofputil_table_map
+}
+
+func (ofpacts *FlowStatsOfpacts) String() string {
+	cParams := C.malloc(C.sizeof_struct_ofpact_format_params)
+	defer C.free(cParams)
+
+	cParamsStruct := (*C.struct_ofpact_format_params)(cParams)
+	cParamsStruct.port_map = ofpacts.portMap
+	cParamsStruct.table_map = ofpacts.tableMap
+	cParamsStruct.s = &C.struct_ds{}
+
+	C.ofpacts_format(ofpacts.ptr, ofpacts.len, cParamsStruct)
+
+	return C.GoString(C.ds_cstr(cParamsStruct.s))
+}
+
+func (ofpacts *FlowStatsOfpacts) string() string {
+	if ofpacts.len == 0 {
+		return "drop"
+	}
+
+	var actions []string
+
+	for offset := C.size_t(0); offset < ofpacts.len; {
+		ofpact := (*C.struct_ofpact)(
+			unsafe.Pointer(uintptr(unsafe.Pointer(ofpacts.ptr)) + uintptr(offset)),
+		)
+
+		switch OfpactType(ofpact._type) {
+		case OFPACT_OUTPUT:
+			output := (*C.struct_ofpact_output)(unsafe.Pointer(ofpact))
+			port := C.get_ofpact_output_port(output)
+
+			actions = append(actions, fmt.Sprintf("output:%d", int(port)))
+		case OFPACT_RESUBMIT:
+			resubmit := (*C.struct_ofpact_resubmit)(unsafe.Pointer(ofpact))
+			tableID := C.get_ofpact_resubmit_table_id(resubmit)
+
+			actions = append(actions, fmt.Sprintf("resubmit(%d)", int(tableID)))
+		default:
+			actions = append(actions, fmt.Sprintf("UNKNOWN(%v)", ofpact._type))
+		}
+
+		offset += C.size_t(ofpact.len)
+	}
+
+	return strings.Join(actions, ",")
+}
+
+type FlowStats struct {
+	ptr *C.struct_ofputil_flow_stats
+
+	portMap  *C.struct_ofputil_port_map
+	tableMap *C.struct_ofputil_table_map
+}
+
+func (fs *FlowStats) Cookie() uint {
+	return uint(fs.ptr.cookie)
+}
+
+func (fs *FlowStats) Duration() *FlowStatsDuration {
+	return &FlowStatsDuration{ptr: fs.ptr}
+}
+
+func (fs *FlowStats) Table() byte {
+	return byte(fs.ptr.table_id)
+}
+
+func (fs *FlowStats) PacketCount() uint64 {
+	return uint64(fs.ptr.packet_count)
+}
+
+func (fs *FlowStats) ByteCount() uint64 {
+	return uint64(fs.ptr.byte_count)
+}
+
+func (fs *FlowStats) Priority() uint16 {
+	return uint16(fs.ptr.priority)
+}
+
+func (fs *FlowStats) Ofpacts() *FlowStatsOfpacts {
+	return &FlowStatsOfpacts{
+		ptr:      fs.ptr.ofpacts,
+		len:      fs.ptr.ofpacts_len,
+		portMap:  fs.portMap,
+		tableMap: fs.tableMap,
+	}
+}
+
+func (fs *FlowStats) String() string {
+	var elems []string
+
+	// if show_stats
+	elems = append(elems, fmt.Sprintf("cookie=0x%x", fs.Cookie()))
+	elems = append(elems, fmt.Sprintf("duration=%ss", fs.Duration()))
+
+	elems = append(elems, fmt.Sprintf("table=%d", fs.Table()))
+
+	elems = append(elems, fmt.Sprintf("n_packets=%d", fs.PacketCount()))
+	elems = append(elems, fmt.Sprintf("n_bytes=%d", fs.ByteCount()))
+
+	elems = append(elems, fmt.Sprintf("priority=%d", fs.Priority()))
+
+	elems = append(elems, fmt.Sprintf("actions=%s", fs.Ofpacts()))
+
+	return strings.Join(elems, ", ")
+}
+
+func DumpFlows(bridge string) (flowStats []*FlowStats, err error) {
+	//args := []string{"ovs-ofctl", "--no-stats", "dump-flows", bridge}
+	//args := []string{"dump-flows", bridge}
+
+	//cBridge := C.CString(bridge)
+	//defer C.free(unsafe.Pointer(cBridge))
+
+	/*
+		argc := C.int(len(args))
+		argv := make([]*C.char, len(args))
+		for i, arg := range args {
+			argv[i] = C.CString(arg)
+		}
+		defer func() {
+			for i := range args {
+				C.free(unsafe.Pointer(argv[i]))
+			}
+		}()
+	*/
+
+	/*
+		C.parse_options(argc, &argv[0])
+
+		var ctx *C.struct_ovs_cmdl_context
+		{
+			ctx = (*C.struct_ovs_cmdl_context)(C.malloc(C.sizeof_struct_ovs_cmdl_context))
+			defer C.free(unsafe.Pointer(ctx))
+		}
+
+		ctx.argc = argc - C.optind
+		ctx.argv = &argv[C.optind]
+	*/
+
+	/*
+		stdout, stderr := catchStd(func() {
+			C.ofctl_dump_flows(ctx)
+		})
+
+		if stderr != "" {
+			return stdout, fmt.Errorf(stderr)
+		}
+
+		return stdout, nil
+	*/
+
+	var fsr *C.struct_ofputil_flow_stats_request
+	{
+		fsr = (*C.struct_ofputil_flow_stats_request)(C.malloc(C.sizeof_struct_ofputil_flow_stats_request))
+		defer C.free(unsafe.Pointer(fsr))
+	}
+
+	/*
+		var protocol C.enum_ofputil_protocol
+		var vconn *C.struct_vconn
+		vconn = C.prepare_dump_flows(ctx.argc, ctx.argv, C.bool(false), fsr, &protocol)
+		if vconn == nil {
+			return "", fmt.Errorf("failed to prepare dump flows")
+		}
+		defer C.vconn_close(vconn)
+	*/
+	/*
+		var protocol C.enum_ofputil_protocol
+		var vconn *C.struct_vconn
+		vconn, err := prepareDumpFlows(args[C.optind:], false, fsr, &protocol)
+		if err != nil {
+			return "", err
+		}
+		defer C.vconn_close(vconn)
+	*/
+
+	connection := NewConnection()
+	err = connection.Open(bridge)
+	if err != nil {
+		return nil, err
+	}
+	defer connection.Close()
+
+	var portMap *C.struct_ofputil_port_map
+	{
+		portMap = C.get_port_map(connection.name)
+	}
+	var tableMap *C.struct_ofputil_table_map
+	{
+		tableMap = C.get_table_map(connection.name)
+	}
+
+	var protocol C.enum_ofputil_protocol
+	{
+		// Получение данных для обработки строки запроса
+		match := C.CString("")
+		/*
+			{
+				if len(args[C.optind:]) > 2 {
+					match = C.CString(args[C.optind:][2])
+					defer C.free(unsafe.Pointer(match))
+				}
+			}
+		*/
+
+		var usableProtocols C.enum_ofputil_protocol
+		errorMsg := C.parse_ofp_flow_stats_request_str(fsr, C.bool(false), match, portMap, tableMap, &usableProtocols)
+		if errorMsg != nil {
+			return nil, fmt.Errorf("failed to parse flow stats request: %s", C.GoString(errorMsg))
+		}
+
+		/*
+			var vconn *C.struct_vconn
+			protocol := C.open_vconn(vconnName, &vconn)
+			// Открытие соединения
+			if vconn == nil {
+				return nil, fmt.Errorf("failed to open vconn: %s", argv[1])
+			}
+
+			// Установка протокола для дампа потоков
+			*protocolp = C.set_protocol_for_flow_dump(vconn, protocol, usableProtocols)
+		*/
+		protocol = C.set_protocol_for_flow_dump(connection.ptr, connection.protocol, usableProtocols)
+	}
+
+	var n_fses C.size_t
+	var fses *C.struct_ofputil_flow_stats
+	{
+		fses = (*C.struct_ofputil_flow_stats)(C.malloc(C.sizeof_struct_ofputil_flow_stats))
+		defer C.free(unsafe.Pointer(fses))
+		/*
+			defer func() {
+				for i := C.size_t(0); i < n_fses; i++ {
+					C.free(
+						unsafe.Pointer(
+							(*C.struct_ofputil_flow_stats)(
+								unsafe.Pointer(uintptr(unsafe.Pointer(fses)) + uintptr(i)*unsafe.Sizeof(*fses)),
+							).ofpacts,
+						),
+					)
+				}
+			}()
+		*/
+	}
+
+	C.vconn_dump_flows(connection.ptr, fsr, protocol, &fses, &n_fses)
+
+	flowStats = make([]*FlowStats, int(n_fses))
+	for i := C.size_t(0); i < n_fses; i++ {
+		flowStats[i] = &FlowStats{
+			ptr: (*C.struct_ofputil_flow_stats)(
+				unsafe.Pointer(uintptr(unsafe.Pointer(fses)) + uintptr(i)*unsafe.Sizeof(*fses)),
+			),
+			portMap:  portMap,  //(*C.struct_ofputil_port_map)(unsafe.Pointer(C.NULL)),
+			tableMap: tableMap, //(*C.struct_ofputil_table_map)(unsafe.Pointer(C.NULL)),
+		}
+		/*
+			var s C.struct_ds
+			C.ds_init(&s)
+			C.ofputil_flow_stats_format(
+				&s,
+				(*C.struct_ofputil_flow_stats)(unsafe.Pointer(uintptr(unsafe.Pointer(fses))+uintptr(i)*unsafe.Sizeof(*fses))),
+				C.ports_to_show(cBridge),  // C.ports_to_show(argv[C.optind+1]),
+				C.tables_to_show(cBridge), // C.tables_to_show(argv[C.optind+1]),
+				C.bool(isShowStats),       //C.show_stats,
+			)
+			result += fmt.Sprintf(" %s\n", C.GoString(C.ds_cstr(&s)))
+			C.ds_destroy(&s)
+		*/
+	}
+
+	return flowStats, nil
+}
